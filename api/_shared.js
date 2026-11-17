@@ -28,7 +28,7 @@ function csv(text) {
   return rows.map(values => Object.fromEntries(headers.map((h, i) => [h, (values[i] || '').trim()])));
 }
 
-async function readZipEntries(names, onChunk = {}) {
+async function readZipEntries(names, onChunk = {}, optional = new Set()) {
   const response = await fetch(A, { signal: AbortSignal.timeout(45000), cache: 'no-store' });
   if (!response.ok || !response.body) throw new Error(`GTFS de Renfe no disponible (${response.status}).`);
   const pending = new Map();
@@ -54,7 +54,7 @@ async function readZipEntries(names, onChunk = {}) {
     if (done) break;
   }
   await Promise.all(pending.values());
-  for (const name of names) if (!pending.has(name)) throw new Error(`GTFS incompleto: falta ${name}`);
+  for (const name of names) if (!pending.has(name) && !optional.has(name)) throw new Error(`GTFS incompleto: falta ${name}`);
   return new Map(await Promise.all([...pending].map(async ([name, promise]) => [name, await promise])));
 }
 
@@ -75,8 +75,9 @@ export async function loadTodaySchedule() {
     if (blob?.statusCode === 200) return { schedule: await new Response(blob.stream).json(), cache: 'hit' };
   } catch { /* Primer acceso del día: descargar GTFS. */ }
   const smallNames = new Set(['routes.txt','trips.txt','stops.txt','calendar.txt','calendar_dates.txt']);
-  const small = await readZipEntries(smallNames);
+  const small = await readZipEntries(smallNames, {}, new Set(['calendar_dates.txt']));
   const asText = name => { const chunks=small.get(name), size=chunks.reduce((n,c)=>n+c.length,0), bytes=new Uint8Array(size); let offset=0; for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;} return csv(strFromU8(bytes)); };
+  const asOptionalText = name => { const chunks=small.get(name); if(!chunks)return []; const size=chunks.reduce((n,c)=>n+c.length,0),bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}return csv(strFromU8(bytes)); };
   const routes = new Set(asText('routes.txt').filter(r => r.route_short_name === 'R4').map(r => r.route_id));
   const trips = asText('trips.txt').filter(t => routes.has(t.route_id));
   const wanted = new Set(trips.map(t => t.trip_id));
@@ -89,7 +90,8 @@ export async function loadTodaySchedule() {
     for(const line of lines){ if(!line)continue; const values=line.split(','); if(!stopHeaders.length){stopHeaders=values;continue;} const row=Object.fromEntries(stopHeaders.map((key,i)=>[key,values[i]||''])); if(wanted.has(row.trip_id)){ if(!byTrip.has(row.trip_id))byTrip.set(row.trip_id,[]); byTrip.get(row.trip_id).push([row.stop_id,stops.get(row.stop_id)?.name||row.stop_id,row.arrival_time,row.departure_time,Number(row.stop_sequence)]); }}
   }});
   const calendar = asText('calendar.txt');
-  let exceptions=[]; try { exceptions=asText('calendar_dates.txt'); } catch {}
+  // calendar_dates.txt es opcional en GTFS; si Renfe no lo publica, usamos calendar.txt.
+  const exceptions=asOptionalText('calendar_dates.txt');
   const serviceSet = serviceRunsToday(calendar, exceptions, todayMadrid());
   const resultTrips=[];
   for (const t of trips) {
