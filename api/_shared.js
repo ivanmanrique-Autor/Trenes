@@ -1,5 +1,5 @@
 import { get, put } from '@vercel/blob';
-import { unzipSync, strFromU8 } from 'fflate';
+import { Unzip, UnzipInflate, strFromU8 } from 'fflate';
 
 export const A = 'https://ssl.renfe.com/ftransit/Fichero_CER_FOMENTO/fomento_transit.zip';
 export const tripsFeed = 'https://gtfsrt.renfe.com/trip_updates.json';
@@ -28,6 +28,36 @@ function csv(text) {
   return rows.map(values => Object.fromEntries(headers.map((h, i) => [h, (values[i] || '').trim()])));
 }
 
+async function readZipEntries(names, onChunk = {}) {
+  const response = await fetch(A, { signal: AbortSignal.timeout(45000), cache: 'no-store' });
+  if (!response.ok || !response.body) throw new Error(`GTFS de Renfe no disponible (${response.status}).`);
+  const pending = new Map();
+  const unzip = new Unzip(file => {
+    const name = file.name.split('/').at(-1);
+    if (!names.has(name)) return;
+    let chunks = [];
+    pending.set(name, new Promise((resolve, reject) => {
+      file.ondata = (error, data, final) => {
+        if (error) return reject(error);
+        if (onChunk[name]) onChunk[name](data, final);
+        else chunks.push(data);
+        if (final) resolve(onChunk[name] ? null : chunks);
+      };
+    }));
+    file.start();
+  });
+  unzip.register(UnzipInflate);
+  const reader = response.body.getReader();
+  while (true) {
+    const { value, done } = await reader.read();
+    unzip.push(value || new Uint8Array(), done);
+    if (done) break;
+  }
+  await Promise.all(pending.values());
+  for (const name of names) if (!pending.has(name)) throw new Error(`GTFS incompleto: falta ${name}`);
+  return new Map(await Promise.all([...pending].map(async ([name, promise]) => [name, await promise])));
+}
+
 function serviceRunsToday(calendar, exceptions, ymd) {
   const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
   const [y,m,d] = [Number(ymd.slice(0,4)),Number(ymd.slice(4,6)),Number(ymd.slice(6,8))];
@@ -44,21 +74,22 @@ export async function loadTodaySchedule() {
     const blob = await get(key, { access: 'private', useCache: false });
     if (blob?.statusCode === 200) return { schedule: await new Response(blob.stream).json(), cache: 'hit' };
   } catch { /* Primer acceso del día: descargar GTFS. */ }
-  const response = await fetch(A, { signal: AbortSignal.timeout(45000), cache: 'no-store' });
-  if (!response.ok) throw new Error(`GTFS de Renfe no disponible (${response.status}).`);
-  const archive = unzipSync(new Uint8Array(await response.arrayBuffer()));
-  const read = name => { const file = Object.entries(archive).find(([path]) => path.split('/').at(-1) === name)?.[1]; if (!file) throw new Error(`GTFS incompleto: falta ${name}`); return csv(strFromU8(file)); };
-  const routes = new Set(read('routes.txt').filter(r => r.route_short_name === 'R4').map(r => r.route_id));
-  const trips = read('trips.txt').filter(t => routes.has(t.route_id));
+  const smallNames = new Set(['routes.txt','trips.txt','stops.txt','calendar.txt','calendar_dates.txt']);
+  const small = await readZipEntries(smallNames);
+  const asText = name => { const chunks=small.get(name), size=chunks.reduce((n,c)=>n+c.length,0), bytes=new Uint8Array(size); let offset=0; for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;} return csv(strFromU8(bytes)); };
+  const routes = new Set(asText('routes.txt').filter(r => r.route_short_name === 'R4').map(r => r.route_id));
+  const trips = asText('trips.txt').filter(t => routes.has(t.route_id));
   const wanted = new Set(trips.map(t => t.trip_id));
-  const stops = new Map(read('stops.txt').map(s => [s.stop_id, { id:s.stop_id, name:s.stop_name, lat:Number(s.stop_lat), lon:Number(s.stop_lon) }]));
+  const stops = new Map(asText('stops.txt').map(s => [s.stop_id, { id:s.stop_id, name:s.stop_name, lat:Number(s.stop_lat), lon:Number(s.stop_lon) }]));
   const byTrip = new Map();
-  for (const st of read('stop_times.txt')) if (wanted.has(st.trip_id)) {
-    if (!byTrip.has(st.trip_id)) byTrip.set(st.trip_id, []);
-    byTrip.get(st.trip_id).push([st.stop_id, stops.get(st.stop_id)?.name || st.stop_id, st.arrival_time, st.departure_time, Number(st.stop_sequence)]);
-  }
-  const calendar = read('calendar.txt');
-  let exceptions=[]; try { exceptions=read('calendar_dates.txt'); } catch {}
+  let stopBuffer=''; let stopHeaders=[];
+  await readZipEntries(new Set(['stop_times.txt']), {'stop_times.txt':(data,final)=>{
+    stopBuffer += new TextDecoder().decode(data,{stream:!final});
+    const lines=stopBuffer.split(/\r?\n/); stopBuffer=final?'':lines.pop()||'';
+    for(const line of lines){ if(!line)continue; const values=line.split(','); if(!stopHeaders.length){stopHeaders=values;continue;} const row=Object.fromEntries(stopHeaders.map((key,i)=>[key,values[i]||''])); if(wanted.has(row.trip_id)){ if(!byTrip.has(row.trip_id))byTrip.set(row.trip_id,[]); byTrip.get(row.trip_id).push([row.stop_id,stops.get(row.stop_id)?.name||row.stop_id,row.arrival_time,row.departure_time,Number(row.stop_sequence)]); }}
+  }});
+  const calendar = asText('calendar.txt');
+  let exceptions=[]; try { exceptions=asText('calendar_dates.txt'); } catch {}
   const serviceSet = serviceRunsToday(calendar, exceptions, todayMadrid());
   const resultTrips=[];
   for (const t of trips) {
