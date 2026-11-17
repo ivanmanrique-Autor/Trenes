@@ -1,0 +1,82 @@
+import { get, put } from '@vercel/blob';
+import { unzipSync, strFromU8 } from 'fflate';
+
+export const A = 'https://ssl.renfe.com/ftransit/Fichero_CER_FOMENTO/fomento_transit.zip';
+export const tripsFeed = 'https://gtfsrt.renfe.com/trip_updates.json';
+export const vehiclesFeed = 'https://gtfsrt.renfe.com/vehicle_positions.json';
+export const stationFallback = [
+  { id: '78706', name: 'Cerdanyola del Vallès', lat: 41.4925608, lon: 2.14752164 },
+  { id: '71801', name: 'Barcelona-Sants', lat: 41.3798632, lon: 2.14101688 }
+];
+
+export const json = (res, data, status = 200) => res.status(status).setHeader('Cache-Control', 'no-store').json(data);
+export const todayMadrid = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()).replaceAll('-', '');
+export const datePath = () => todayMadrid().replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3');
+
+function csv(text) {
+  const rows = []; let row = [], field = '', quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted && c === '"' && text[i + 1] === '"') { field += '"'; i++; }
+    else if (c === '"') quoted = !quoted;
+    else if (c === ',' && !quoted) { row.push(field); field = ''; }
+    else if ((c === '\n' || c === '\r') && !quoted) { if (c === '\r' && text[i + 1] === '\n') i++; row.push(field); if (row.some(Boolean)) rows.push(row); row = []; field = ''; }
+    else field += c;
+  }
+  if (field || row.length) { row.push(field); rows.push(row); }
+  const headers = rows.shift()?.map(x => x.trim()) || [];
+  return rows.map(values => Object.fromEntries(headers.map((h, i) => [h, (values[i] || '').trim()])));
+}
+
+function serviceRunsToday(calendar, exceptions, ymd) {
+  const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+  const [y,m,d] = [Number(ymd.slice(0,4)),Number(ymd.slice(4,6)),Number(ymd.slice(6,8))];
+  const weekday = days[new Date(Date.UTC(y,m-1,d)).getUTCDay()];
+  const active = new Set(calendar.filter(x => ymd >= x.start_date && ymd <= x.end_date && x[weekday] === '1').map(x => x.service_id));
+  for (const e of exceptions) if (e.date === ymd) { if (e.exception_type === '1') active.add(e.service_id); else if (e.exception_type === '2') active.delete(e.service_id); }
+  return active;
+}
+
+export async function loadTodaySchedule() {
+  if (!process.env.BLOB_READ_WRITE_TOKEN) throw new Error('Falta conectar Vercel Blob: Storage → Create → Blob y enlazarlo al proyecto.');
+  const key = `r4-daily/${datePath()}.json`;
+  try {
+    const blob = await get(key, { access: 'private', useCache: false });
+    if (blob?.statusCode === 200) return { schedule: await new Response(blob.stream).json(), cache: 'hit' };
+  } catch { /* Primer acceso del día: descargar GTFS. */ }
+  const response = await fetch(A, { signal: AbortSignal.timeout(45000), cache: 'no-store' });
+  if (!response.ok) throw new Error(`GTFS de Renfe no disponible (${response.status}).`);
+  const archive = unzipSync(new Uint8Array(await response.arrayBuffer()));
+  const read = name => { const file = Object.entries(archive).find(([path]) => path.split('/').at(-1) === name)?.[1]; if (!file) throw new Error(`GTFS incompleto: falta ${name}`); return csv(strFromU8(file)); };
+  const routes = new Set(read('routes.txt').filter(r => r.route_short_name === 'R4').map(r => r.route_id));
+  const trips = read('trips.txt').filter(t => routes.has(t.route_id));
+  const wanted = new Set(trips.map(t => t.trip_id));
+  const stops = new Map(read('stops.txt').map(s => [s.stop_id, { id:s.stop_id, name:s.stop_name, lat:Number(s.stop_lat), lon:Number(s.stop_lon) }]));
+  const byTrip = new Map();
+  for (const st of read('stop_times.txt')) if (wanted.has(st.trip_id)) {
+    if (!byTrip.has(st.trip_id)) byTrip.set(st.trip_id, []);
+    byTrip.get(st.trip_id).push([st.stop_id, stops.get(st.stop_id)?.name || st.stop_id, st.arrival_time, st.departure_time, Number(st.stop_sequence)]);
+  }
+  const calendar = read('calendar.txt');
+  let exceptions=[]; try { exceptions=read('calendar_dates.txt'); } catch {}
+  const serviceSet = serviceRunsToday(calendar, exceptions, todayMadrid());
+  const resultTrips=[];
+  for (const t of trips) {
+    if (!serviceSet.has(t.service_id)) continue;
+    const all=(byTrip.get(t.trip_id)||[]).sort((a,b)=>a[4]-b[4]);
+    const ci=all.findIndex(s=>s[0]==='78706'), si=all.findIndex(s=>s[0]==='71801');
+    if (ci<0 || si<0) continue;
+    resultTrips.push({ tripId:t.trip_id, serviceId:t.service_id, headsign:t.trip_headsign||'', stops:all });
+  }
+  const used = new Set(resultTrips.flatMap(t=>t.stops.map(s=>s[0])));
+  const schedule={date:datePath(),fetchedAt:new Date().toISOString(),stations:[...used].map(id=>stops.get(id)).filter(Boolean).sort((a,b)=>a.name.localeCompare(b.name,'ca')),trips:resultTrips};
+  await put(key, JSON.stringify(schedule), { access:'private', addRandomSuffix:false, allowOverwrite:true, contentType:'application/json', cacheControlMaxAge:60 });
+  return { schedule, cache:'miss' };
+}
+
+export function madridEpoch(ymd, time) {
+  const [y,m,d]=[+ymd.slice(0,4),+ymd.slice(4,6),+ymd.slice(6,8)];
+  const [h,mi,s]=time.split(':').map(Number); const base=Date.UTC(y,m-1,d+Math.floor(h/24),h%24,mi,s||0); let guess=base;
+  for(let i=0;i<2;i++){const p=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Madrid',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(guess)).map(x=>[x.type,x.value]));guess+=base-Date.UTC(+p.year,+p.month-1,+p.day,+p.hour,+p.minute,+p.second)}
+  return Math.floor(guess/1000);
+}
