@@ -1,0 +1,8 @@
+{
+  "name": "r4-cerdanyola-sants",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "vercel dev" },
+  "dependencies": { "@vercel/blob": "^2.0.0", "fflate": "^0.8.2" },
+  "devDependencies": { "vercel": "^48.0.0" }
+}
